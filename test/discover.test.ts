@@ -111,4 +111,86 @@ describe("casos de borda da listagem", () => {
     expect(result.creators).toEqual([]);
     expect(result.total).toBe(4);
   });
+
+  it("soma a última métrica de cada conta sem multiplicar as entregas", async () => {
+    const db = openDatabase();
+    db.exec(`
+      INSERT INTO campaigns VALUES ('cmp_edge', 'Contas', '["beleza"]');
+      INSERT INTO creators VALUES ('crt_a', 'Duas contas', '["beleza"]', '');
+      INSERT INTO social_accounts VALUES
+        ('acc_a', 'crt_a', 'instagram'),
+        ('acc_b', 'crt_a', 'tiktok');
+      INSERT INTO metrics VALUES
+        ('met_a_old', 'acc_a', 900, '2026-05-01T00:00:00.000Z', ''),
+        ('met_a_new', 'acc_a', 10, '2026-05-30T00:00:00.000Z', ''),
+        ('met_b_old', 'acc_b', 800, '2026-05-01T00:00:00.000Z', ''),
+        ('met_b_new', 'acc_b', 20, '2026-05-30T00:00:00.000Z', '');
+      INSERT INTO deliveries VALUES
+        ('del_a1', 'crt_a', '2026-05-01T00:00:00.000Z'),
+        ('del_a2', 'crt_a', '2026-05-02T00:00:00.000Z');
+    `);
+
+    try {
+      const result = await page(createApp(db));
+      expect(result.creators).toEqual([
+        {
+          id: "crt_a",
+          name: "Duas contas",
+          niche_score: 1,
+          latest_reach: 30,
+          deliveries_90d: 2,
+        },
+      ]);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("preserva ordem, total e teto de queries nas páginas de uma população maior", async () => {
+    const db = openDatabase();
+    db.exec(`INSERT INTO campaigns VALUES ('cmp_edge', 'Páginas', '["beleza","moda"]')`);
+    const expected = [
+      {
+        id: "crt_priority",
+        name: "Dois nichos",
+        niche_score: 2,
+        latest_reach: 0,
+        deliveries_90d: 0,
+      },
+    ];
+
+    for (let i = 0; i < 125; i += 1) {
+      expected.push({
+        id: `crt_${String(i).padStart(3, "0")}`,
+        name: `Criador ${i}`,
+        niche_score: 1,
+        latest_reach: 0,
+        deliveries_90d: 0,
+      });
+    }
+
+    const insert = db.prepare("INSERT INTO creators VALUES (?, ?, ?, '')");
+    for (const creator of [...expected].reverse()) {
+      const niches = creator.niche_score === 2 ? ["beleza", "moda"] : ["beleza"];
+      insert.run(creator.id, creator.name, JSON.stringify(niches));
+    }
+    insert.run("crt_other", "Outro nicho", '["games"]');
+
+    try {
+      const app = createApp(db);
+      for (const offset of [0, 20, 120, 126, 200]) {
+        resetQueryCount();
+        const result = await page(app, `?limit=20&offset=${offset}`);
+
+        expect(result).toEqual({
+          campaign_id: "cmp_edge",
+          total: 126,
+          creators: expected.slice(offset, offset + 20),
+        });
+        expect(getQueryCount()).toBeLessThanOrEqual(8);
+      }
+    } finally {
+      db.close();
+    }
+  });
 });

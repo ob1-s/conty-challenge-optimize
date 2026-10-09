@@ -16,11 +16,10 @@ export type CreatorPage = {
   creators: CreatorMatch[];
 };
 
-type CampaignRow = { id: string; niches_json: string; raw_payload?: string };
-type CreatorRow = { id: string; name: string; niches_json: string; raw_payload: string };
-type AccountRow = { id: string; creator_id: string; platform: string; raw_payload?: string };
-type MetricRow = { views: number; raw_payload?: string };
-type CountRow = { n: number };
+type CampaignRow = { id: string; niches_json: string };
+type CreatorRow = { id: string; name: string; niches_json: string };
+type AccountReachRow = { creator_id: string; latest_reach: number | null };
+type DeliveryCountRow = { creator_id: string; n: number };
 
 function compareCreators(left: CreatorMatch, right: CreatorMatch): number {
   if (right.niche_score !== left.niche_score) return right.niche_score - left.niche_score;
@@ -36,59 +35,81 @@ export async function listCreators(
   db: DatabaseSync,
   input: { campaignId: string; limit: number; offset: number },
 ): Promise<CreatorPage | null> {
-  const campaign = await get<CampaignRow>(db, "SELECT * FROM campaigns WHERE id = ?", input.campaignId);
+  const campaign = await get<CampaignRow>(
+    db,
+    "SELECT id, niches_json FROM campaigns WHERE id = ?",
+    input.campaignId,
+  );
+
   if (!campaign) return null;
 
-  const creators = await all<CreatorRow>(db, "SELECT * FROM creators");
-  const since = deliveriesSince();
+  const campaignNiches = JSON.parse(campaign.niches_json) as string[];
+  const creators = await all<CreatorRow>(db, "SELECT id, name, niches_json FROM creators");
+  const accounts = await all<AccountReachRow>(db, `
+    SELECT creator_id,
+      (
+        SELECT views FROM metrics
+        WHERE account_id = social_accounts.id
+        ORDER BY captured_at DESC, id DESC
+        LIMIT 1
+      ) AS latest_reach
+    FROM social_accounts
+  `);
+
+  const reachByCreator = new Map<string, number>();
+
+  for (const account of accounts) {
+    const reach = reachByCreator.get(account.creator_id) ?? 0;
+    reachByCreator.set(account.creator_id, reach + (account.latest_reach ?? 0));
+  }
+
   const scored: CreatorMatch[] = [];
 
   for (const creator of creators) {
-    const campaignNiches = JSON.parse(campaign.niches_json) as string[];
     const creatorNiches = JSON.parse(creator.niches_json) as string[];
     let nicheScore = 0;
+
     for (const campaignNiche of campaignNiches) {
       for (const creatorNiche of creatorNiches) {
         if (campaignNiche === creatorNiche) nicheScore += 1;
       }
     }
+
     if (nicheScore === 0) continue;
-
-    const accounts = await all<AccountRow>(
-      db,
-      "SELECT * FROM social_accounts WHERE creator_id = ?",
-      creator.id,
-    );
-    let latestReach = 0;
-    for (const account of accounts) {
-      const metric = await get<MetricRow>(
-        db,
-        "SELECT * FROM metrics WHERE account_id = ? ORDER BY captured_at DESC, id DESC LIMIT 1",
-        account.id,
-      );
-      if (metric) latestReach += metric.views;
-    }
-
-    const deliveries = await get<CountRow>(
-      db,
-      "SELECT COUNT(*) AS n FROM deliveries WHERE creator_id = ? AND delivered_at >= ?",
-      creator.id,
-      since,
-    );
 
     scored.push({
       id: creator.id,
       name: creator.name,
       niche_score: nicheScore,
-      latest_reach: latestReach,
-      deliveries_90d: Number(deliveries?.n ?? 0),
+      latest_reach: reachByCreator.get(creator.id) ?? 0,
+      deliveries_90d: 0,
     });
   }
 
   scored.sort(compareCreators);
+  const page = scored.slice(input.offset, input.offset + input.limit);
+
+  if (page.length > 0) {
+    const creatorIds = page.map((creator) => creator.id);
+    const placeholders = creatorIds.map(() => "?").join(", ");
+    const deliveries = await all<DeliveryCountRow>(
+      db,
+      `SELECT creator_id, COUNT(*) AS n FROM deliveries
+       WHERE creator_id IN (${placeholders}) AND delivered_at >= ?
+       GROUP BY creator_id`,
+      ...creatorIds,
+      deliveriesSince(),
+    );
+    const deliveriesByCreator = new Map(deliveries.map((row) => [row.creator_id, Number(row.n)]));
+
+    for (const creator of page) {
+      creator.deliveries_90d = deliveriesByCreator.get(creator.id) ?? 0;
+    }
+  }
+
   return {
     campaign_id: input.campaignId,
     total: scored.length,
-    creators: scored.slice(input.offset, input.offset + input.limit),
+    creators: page,
   };
 }
